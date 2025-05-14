@@ -1,151 +1,193 @@
-import { SignJWT, importPKCS8 } from 'jose';
-import type { Env } from './types';
+import { Hono, type Context, type Next } from 'hono';
+import { JWT } from 'google-auth-library';
 
-const SCOPE = 'https://www.googleapis.com/auth/spreadsheets';
-const AUD = 'https://oauth2.googleapis.com/token';
+// Define the Env type for bindings
+export type Env = {
+  // KV Namespace
+  LIST_CACHE: KVNamespace;
 
-/* --- in-memory token cache (per isolate) ----------------------- */
-let tokenCache = { token: '', exp: 0 };
+  // Environment Variables (Secrets)
+  API_KEY: string;
+  SHEET_ID: string;
+  SA_EMAIL: string;
+  SA_PRIVATE_KEY: string;
 
-export default {
-	async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-		const url = new URL(req.url);
-
-		/* 0 ── simple shared-secret gate */
-		if (url.searchParams.get('key') !== env.API_KEY) return new Response('forbidden', { status: 403 });
-
-		/* 1 ── GET /lists  (cached 24 h in KV) ---------------------- */
-		if (url.pathname === '/lists' && req.method === 'GET') {
-			const cached = await env.LIST_CACHE.get('v1', { type: 'json' });
-			if (cached) return json(cached);
-
-			// Check for required environment variables
-			if (typeof env.PURPOSE_TAB !== 'string' || !env.PURPOSE_TAB) {
-				console.error('Server configuration error: PURPOSE_TAB environment variable is not defined or not a string.');
-				return new Response('Server configuration error: Missing PURPOSE_TAB setting.', { status: 500 });
-			}
-			if (typeof env.ACCOUNT_TAB !== 'string' || !env.ACCOUNT_TAB) {
-				console.error('Server configuration error: ACCOUNT_TAB environment variable is not defined or not a string.');
-				return new Response('Server configuration error: Missing ACCOUNT_TAB setting.', { status: 500 });
-			}
-
-			const [purposes, accounts] = await batchGet([`${env.PURPOSE_TAB}!A2:A`, `${env.ACCOUNT_TAB}!A2:A`], env);
-
-			const payload = {
-				purposes: purposes.filter(Boolean),
-				accounts: accounts.filter(Boolean),
-			};
-
-			ctx.waitUntil(
-				// async cache write
-				env.LIST_CACHE.put('v1', JSON.stringify(payload), { expirationTtl: 60 * 60 * 24 }) // 24 h
-			);
-
-			return json(payload);
-		}
-
-		/* 2 ── POST /add ------------------------------------------- */
-		if (url.pathname === '/add' && req.method === 'POST') {
-			const body = (await req.json()) as {
-				date: string;
-				amount: number;
-				currency: string;
-				description: string;
-				purpose: string;
-				account: string;
-			};
-
-			await appendRow([body.date, body.amount, body.currency, body.description, body.purpose, body.account], env);
-
-			return json({ status: 'OK' });
-		}
-
-		/* 3 ── POST /flush-cache ----------------------------------- */
-		if (url.pathname === '/flush-cache' && req.method === 'POST') {
-			try {
-				await env.LIST_CACHE.delete('v1');
-				return json({ status: 'OK', message: "Cache key 'v1' flushed successfully." });
-			} catch (error) {
-				console.error('Error flushing cache:', error);
-				return json({ status: 'Error', message: 'Failed to flush cache.' }, 500);
-			}
-		}
-
-		return new Response('not found', { status: 404 });
-	},
+  // Environment Variables (Non-Secrets)
+  TX_RANGE: string;
+  PURPOSE_TAB: string;
+  ACCOUNT_TAB: string;
 };
 
-/* ---- Google Sheets helpers ----------------------------------- */
+const SCOPE = 'https://www.googleapis.com/auth/spreadsheets';
+const LIST_CACHE_KEY = 'lists-v1'; // Memory mentioned 'v2', but code uses 'lists-v1'. Sticking to 'lists-v1'.
+
+let jwtClient: JWT; // Global JWT client for Google Auth
+
+// --- Helper Functions --- (Adapted to use Env type)
+
+async function accessToken(env: Env): Promise<string> {
+  if (!jwtClient) {
+    jwtClient = new JWT({
+      email: env.SA_EMAIL,
+      key: env.SA_PRIVATE_KEY.replace(/\\n/g, '\n'), // Crucial for env var private keys
+      scopes: [SCOPE],
+    });
+  }
+  await jwtClient.authorize();
+  const token = jwtClient.credentials.access_token;
+  if (!token) throw new Error('Failed to obtain access token');
+  return token;
+}
+
 async function batchGet(ranges: string[], env: Env): Promise<string[][]> {
-	const token = await accessToken(env);
-	const q = ranges.map((r) => 'ranges=' + encodeURIComponent(r)).join('&');
-
-	const res = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${env.SHEET_ID}/values:batchGet?${q}`, {
-		headers: { Authorization: `Bearer ${token}` },
-	});
-
-	if (!res.ok) {
-		console.error(`Google Sheets API error: ${res.status} ${res.statusText}. Response body: ${await res.text()}`);
-		// Return an array of empty arrays, one for each requested range
-		return ranges.map(() => []);
-	}
-
-	// Make valueRanges optional in the type to handle cases where it might be missing
-	const r = await res.json() as { valueRanges?: { values?: string[][] }[] };
-
-	// If valueRanges is not present in the response, or is not an array
-	if (!r.valueRanges || !Array.isArray(r.valueRanges)) {
-		console.error('Google Sheets API response did not contain a valid valueRanges array. Response:', r);
-		// Return an array of empty arrays, matching the number of requested ranges
-		return ranges.map(() => []);
-	}
-
-	console.log('Google Sheets API response:', JSON.stringify(r, null, 2));
-	return r.valueRanges.map((v) => v.values?.flat() ?? []);
+  const token = await accessToken(env);
+  const q = ranges.map((r) => `ranges=${encodeURIComponent(r)}`).join('&');
+  const res = await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${env.SHEET_ID}/values:batchGet?${q}`,
+    { headers: { Authorization: `Bearer ${token}` } },
+  );
+  if (!res.ok) {
+    const errorText = await res.text();
+    throw new Error(`Sheets batchGet failed: ${res.status} ${res.statusText} - ${errorText}`);
+  }
+  const { valueRanges } = (await res.json()) as { valueRanges?: { values?: string[][] }[] };
+  // Ensure each sub-array in valueRanges.values is filtered for empty/null strings
+  return valueRanges?.map((v) => v.values?.flat().filter(s => typeof s === 'string' && s.trim() !== '') ?? []) ?? ranges.map(() => []);
 }
 
 async function appendRow(cells: (string | number)[], env: Env): Promise<void> {
-	const token = await accessToken(env);
-	await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${env.SHEET_ID}/values/${env.TX_RANGE}:append?valueInputOption=USER_ENTERED`, {
-		method: 'POST',
-		headers: {
-			'Content-Type': 'application/json',
-			Authorization: `Bearer ${token}`,
-		},
-		body: JSON.stringify({ values: [cells] }),
-	});
+  const token = await accessToken(env);
+  const res = await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${env.SHEET_ID}/values/${encodeURIComponent(env.TX_RANGE)}:append?valueInputOption=USER_ENTERED`,
+    {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ values: [cells] }),
+    },
+  );
+  if (!res.ok) {
+    const errorText = await res.text();
+    throw new Error(`Append failed: ${res.status} ${res.statusText} - ${errorText}`);
+  }
 }
 
-/* ---- Service-account JWT → OAuth 2 access-token -------------- */
-async function accessToken(env: Env): Promise<string> {
-	const now = Math.floor(Date.now() / 1000);
-	if (tokenCache.token && now < tokenCache.exp - 60) return tokenCache.token;
+// --- Hono Application Setup ---
+const app = new Hono<{ Bindings: Env }>();
 
-	const privateKey = await importPKCS8(env.SA_PRIVATE_KEY, 'RS256');
+// Middleware: Server Configuration Check
+app.use('*', async (c: Context<{ Bindings: Env }>, next: Next) => {
+  const { API_KEY, SHEET_ID, TX_RANGE, PURPOSE_TAB, ACCOUNT_TAB, SA_EMAIL, SA_PRIVATE_KEY, LIST_CACHE } = c.env;
+  if (
+    ![API_KEY, SHEET_ID, TX_RANGE, PURPOSE_TAB, ACCOUNT_TAB, SA_EMAIL, SA_PRIVATE_KEY].every(Boolean) ||
+    !LIST_CACHE
+  ) {
+    return c.json({ status: 'ERROR', message: 'Server misconfigured. Essential bindings are missing.' }, 500);
+  }
+  await next();
+});
 
-	const jwt = await new SignJWT({ scope: SCOPE })
-		.setProtectedHeader({ alg: 'RS256' })
-		.setIssuer(env.SA_EMAIL)
-		.setSubject(env.SA_EMAIL)
-		.setAudience(AUD)
-		.setIssuedAt(now)
-		.setExpirationTime(now + 3600)
-		.sign(privateKey);
+// Middleware: API Key Check (applied to all routes after config check)
+app.use('*', async (c: Context<{ Bindings: Env }>, next: Next) => {
+  const url = new URL(c.req.url);
+  // Allow root path without API key for a basic health check
+  if (url.pathname === '/') {
+    await next();
+    return;
+  }
+  if (url.searchParams.get('key') !== c.env.API_KEY) {
+    return c.json({ status: 'ERROR', message: 'Forbidden: Invalid or missing API key.' }, 403);
+  }
+  await next();
+});
 
-	const resp = await fetch(AUD, {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-		body: 'grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=' + encodeURIComponent(jwt),
-	}).then((r) => r.json() as Promise<{ access_token: string; expires_in: number }>);
+// --- Route Handlers ---
 
-	tokenCache = { token: resp.access_token, exp: now + resp.expires_in };
-	return tokenCache.token;
-}
+// GET /lists: Fetches purposes and accounts, uses cache
+app.get('/lists', async (c: Context<{ Bindings: Env }>) => {
+  const env = c.env;
+  try {
+    const cached = await env.LIST_CACHE.get(LIST_CACHE_KEY, { type: 'json' }) as { purposes: string[], accounts: string[] } | null;
+    if (cached) {
+      return c.json(cached);
+    }
 
-/* ---- small helper -------------------------------------------- */
-function json(obj: unknown, status = 200): Response {
-	return new Response(JSON.stringify(obj), {
-		status,
-		headers: { 'Content-Type': 'application/json' },
-	});
-}
+    const [purposesData, accountsData] = await batchGet(
+      [`${env.PURPOSE_TAB}!A2:A`, `${env.ACCOUNT_TAB}!A2:A`],
+      env,
+    );
+    // Data from batchGet is already string[] and filtered by the helper itself.
+    const payload = { purposes: purposesData, accounts: accountsData };
+
+    c.executionCtx.waitUntil(
+      env.LIST_CACHE.put(LIST_CACHE_KEY, JSON.stringify(payload), { expirationTtl: 86400 }), // 24 hours TTL
+    );
+    return c.json(payload);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // console.error('Error in /lists:', message, (err as Error).stack); // For server-side debugging
+    return c.json({ status: 'ERROR', message: 'Failed to fetch lists.', detail: message }, 500);
+  }
+});
+
+// POST /add: Appends a new transaction row
+app.post('/add', async (c: Context<{ Bindings: Env }>) => {
+  const env = c.env;
+  try {
+    // Define the expected type for the request body
+    type AddRequestBody = {
+      date: string;
+      amount: number;
+      currency: string;
+      description: string;
+      purpose: string;
+      account: string;
+    };
+    const body = await c.req.json<AddRequestBody>();
+
+    const { date, amount, currency, description, purpose, account } = body;
+
+    if (!date || amount == null || !currency || !description || !purpose || !account) {
+      return c.json({ status: 'ERROR', message: 'Missing required fields in request body.' }, 400);
+    }
+
+    await appendRow([date, amount, currency, description, purpose, account], env);
+    return c.json({ status: 'OK', message: 'Transaction added successfully.' });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // console.error('Error in /add:', message, (err as Error).stack); // For server-side debugging
+    return c.json({ status: 'ERROR', message: 'Failed to add transaction.', detail: message }, 500);
+  }
+});
+
+// POST /flush-cache: Clears the cache for /lists
+app.post('/flush-cache', async (c: Context<{ Bindings: Env }>) => {
+  const env = c.env;
+  try {
+    await env.LIST_CACHE.delete(LIST_CACHE_KEY);
+    return c.json({ status: 'OK', message: `Cache key '${LIST_CACHE_KEY}' flushed successfully.` });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // console.error('Error in /flush-cache:', message, (err as Error).stack); // For server-side debugging
+    return c.json({ status: 'ERROR', message: 'Failed to flush cache.', detail: message }, 500);
+  }
+});
+
+// Root path for basic health check (does not require API key due to middleware logic)
+app.get('/', (c: Context<{ Bindings: Env }>) => {
+  return c.text('Budget Edge Worker with Hono is running!');
+});
+
+// --- Hono Error Handling ---
+
+// Not Found Handler
+app.notFound((c: Context<{ Bindings: Env }>) => {
+  return c.json({ status: 'ERROR', message: 'Not Found. The requested endpoint does not exist.' }, 404);
+});
+
+// Global Error Handler
+app.onError((err: Error, c: Context<{ Bindings: Env }>) => {
+  // console.error('Global Hono Error:', err.message, err.stack); // For server-side debugging
+  return c.json({ status: 'ERROR', message: 'Internal Server Error.', detail: err.message }, 500);
+});
+
+export default app;
