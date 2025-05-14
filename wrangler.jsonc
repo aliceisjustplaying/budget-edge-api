@@ -3,24 +3,24 @@
  * https://developers.cloudflare.com/workers/wrangler/configuration/
  */
 {
-	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "budget-edge",
-	"main": "src/index.ts",
-	"compatibility_date": "2025-05-14",
-	"compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
-	"observability": {
-		"enabled": true
-	},
-	"placement": { "mode": "smart" },
-	"kv_namespaces": [
-		{
-			"binding": "LIST_CACHE",
-			"id": "47ad2f322ad1433692d34804b9e975b2"
-		}
-	],
-	"vars": {
-		"PURPOSE_TAB": "Purposes",
-		"ACCOUNT_TAB": "Accounts",
-		"TX_RANGE": "Transactions!A2:G"
-	}
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "budget-edge",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-05-14",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "observability": {
+    "enabled": true,
+  },
+  "placement": { "mode": "smart" },
+  "kv_namespaces": [
+    {
+      "binding": "LIST_CACHE",
+      "id": "47ad2f322ad1433692d34804b9e975b2",
+    },
+  ],
+  "vars": {
+    "PURPOSE_TAB": "Purposes",
+    "ACCOUNT_TAB": "Accounts",
+    "TX_RANGE": "Transactions!A2:G",
+  },
 }

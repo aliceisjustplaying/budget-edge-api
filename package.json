@@ -1,24 +1,29 @@
 {
-	"name": "budget-edge",
-	"version": "0.0.0",
-	"private": true,
-	"scripts": {
-		"deploy": "wrangler deploy",
-		"dev": "wrangler dev",
-		"start": "wrangler dev",
-		"test": "vitest",
-		"cf-typegen": "wrangler types"
-	},
-	"devDependencies": {
-		"@cloudflare/vitest-pool-workers": "^0.8.19",
-		"@types/node": "^22.15.18",
-		"typescript": "^5.5.2",
-		"vitest": "~3.0.7",
-		"wrangler": "^4.14.4"
-	},
-	"dependencies": {
-		"google-auth-library": "^9.15.1",
-		"hono": "^4.4.13",
-		"jose": "^6.0.11"
-	}
+  "name": "budget-edge",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "start": "wrangler dev",
+    "cf-typegen": "wrangler types",
+    "format": "npx prettier --write .",
+    "lint": "npx eslint .",
+    "lint:fix": "npx eslint --fix ."
+  },
+  "devDependencies": {
+    "@trivago/prettier-plugin-sort-imports": "^5.2.2",
+    "@types/node": "^22.15.18",
+    "prettier": "^3.5.3",
+    "typescript": "^5.5.2",
+    "wrangler": "^4.14.4",
+    "@eslint/js": "^9.26.0",
+    "eslint": "^9.26.0",
+    "typescript-eslint": "^8.32.1"
+  },
+  "dependencies": {
+    "google-auth-library": "^9.15.1",
+    "hono": "^4.4.13",
+    "jose": "^6.0.11"
+  }
 }
